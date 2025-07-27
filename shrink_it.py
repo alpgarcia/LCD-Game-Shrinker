@@ -27,6 +27,8 @@ from pathlib import Path
 import re, lxml
 from struct import pack
 from PIL import Image,ImageChops
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 import importlib
 
@@ -46,6 +48,11 @@ output_dir   ="./output/"
 
 DEBUG = False
 
+# OPTIMIZACIÓN: Configuración de paralelización
+# Número de hilos para exportación paralela (0 = automático basado en CPU cores)
+PARALLEL_EXPORT_THREADS = 0  # 0 = auto, 1 = secuencial, >1 = paralelo
+EXPORT_TIMEOUT = 30  # Timeout en segundos para cada exportación
+
 
 # select if the ROM data are compressed with ZLIB, LZ4 or LZMA
 LZ4_COMPRESSOR =1
@@ -55,9 +62,9 @@ LZMA_COMPRESSOR=3
 COMPRESS_WITH = LZ4_COMPRESSOR
 #COMPRESS_WITH = LZMA_COMPRESSOR
 
-#G&W LCD resolution
-gw_width=320
-gw_height=240
+# G&W LCD resolution - será configurado por argumentos de línea de comandos
+gw_width = 320  # Valor por defecto
+gw_height = 240  # Valor por defecto
 
 def log(s):
   if DEBUG:
@@ -72,6 +79,35 @@ def error(s):
 
 #try to locate tools
 inkscape_path = os.environ["INKSCAPE_PATH"] if "INKSCAPE_PATH" in os.environ else "inkscape"
+
+def export_single_segment(args):
+    """
+    Función optimizada para exportar un segmento individual
+    Args: (obj_id, seg_file, inverted_lcd, index, total)
+    Returns: (success, obj_id, message)
+    """
+    obj_id, seg_file, inverted_lcd, index, total = args
+    
+    try:
+        # Comando optimizado con --export-id-only
+        if inverted_lcd:
+            cmd = f"{inkscape_path} {seg_file} --export-id='{obj_id}' --export-id-only --export-overwrite --export-area-snap --export-background=#000000 --export-type=png"
+        else:
+            cmd = f"{inkscape_path} {seg_file} --export-id='{obj_id}' --export-id-only --export-overwrite --export-area-snap --export-background=#FFFFFF --export-type=png"
+        
+        start_time = time.time()
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=EXPORT_TIMEOUT)
+        elapsed = time.time() - start_time
+        
+        if result.returncode == 0:
+            return (True, obj_id, f"✓ {obj_id} ({elapsed:.1f}s)")
+        else:
+            return (False, obj_id, f"✗ {obj_id}: {result.stderr.strip()}")
+            
+    except subprocess.TimeoutExpired:
+        return (False, obj_id, f"⚠ {obj_id}: timeout after {EXPORT_TIMEOUT}s")
+    except Exception as e:
+        return (False, obj_id, f"✗ {obj_id}: {str(e)}")
 
 # Print iterations progress
 def printProgressBar (iteration, total, prefix = '', suffix = '', length = 20, fill = "▆"):
@@ -96,10 +132,82 @@ def osmkdir (path):
   if not os.path.isdir(path):
     os.mkdir(path)
 
-if len(sys.argv) < 2:
- rom_file  = "./input/rom/"
-else:
-  rom_file  = sys.argv[1]
+def parse_resolution(res_str):
+  """
+  Parsea un string de resolución en formato "320x240" o "320,240"
+  Returns: (width, height) tuple
+  """
+  try:
+    if 'x' in res_str:
+      parts = res_str.split('x')
+    elif ',' in res_str:
+      parts = res_str.split(',')
+    else:
+      raise ValueError("Formato incorrecto")
+    
+    width = int(parts[0].strip())
+    height = int(parts[1].strip())
+    
+    if width <= 0 or height <= 0:
+      raise ValueError("Dimensiones deben ser positivas")
+    
+    return width, height
+  except (ValueError, IndexError):
+    error(f"Formato de resolución inválido: '{res_str}'. Use formato 'WIDTHxHEIGHT' (ej: 320x240)")
+
+def show_help():
+  """Muestra la ayuda del programa"""
+  print("""
+LCD Game Shrinker - Conversor de ROMs MAME a Game & Watch
+
+Uso:
+  python3 shrink_it.py <rom_file> [opciones]
+  
+Argumentos:
+  rom_file                  Archivo ROM (.zip/.7z) o directorio con ROMs
+  
+Opciones:
+  --resolution WxH          Resolución de salida (por defecto: 320x240)
+                           Ejemplos: --resolution 640x480
+                                    --resolution 480x320
+  --help, -h               Muestra esta ayuda
+  
+Ejemplos:
+  python3 shrink_it.py gnw_ball.zip
+  python3 shrink_it.py gnw_ball.zip --resolution 640x480
+  python3 shrink_it.py ./roms/
+  """)
+
+# Parsear argumentos de línea de comandos
+import argparse
+
+def parse_arguments():
+  """Parsea los argumentos de línea de comandos"""
+  parser = argparse.ArgumentParser(description='LCD Game Shrinker - Conversor de ROMs MAME a Game & Watch', add_help=False)
+  parser.add_argument('rom_file', nargs='?', default="./input/rom/", 
+                     help='Archivo ROM (.zip/.7z) o directorio con ROMs')
+  parser.add_argument('--resolution', type=str, default='320x240',
+                     help='Resolución de salida en formato WIDTHxHEIGHT (por defecto: 320x240)')
+  parser.add_argument('--help', '-h', action='store_true', help='Muestra esta ayuda')
+  
+  return parser.parse_args()
+
+# Procesar argumentos
+args = parse_arguments()
+
+if args.help:
+  show_help()
+  exit(0)
+
+rom_file = args.rom_file
+
+# Parsear resolución personalizada
+try:
+  gw_width, gw_height = parse_resolution(args.resolution)
+  if args.resolution != '320x240':
+    print(f"📐 Resolución personalizada: {gw_width}x{gw_height}")
+except:
+  error(f"Resolución inválida: {args.resolution}")
 
 rom_path = os.path.dirname(rom_file)
 rom_name = os.path.splitext(os.path.basename(rom_file))[0]
@@ -110,7 +218,11 @@ if os.path.isdir(rom_file) :
   ## call this script for each file
   for x in os.listdir(rom_file) :
     if x.endswith(".zip") or x.endswith(".7z"):
-      subprocess.run([sys.executable, sys.argv[0], os.path.join(rom_path, str(x))])
+      # Pasar los argumentos de resolución a las llamadas recursivas
+      cmd_args = [sys.executable, sys.argv[0], os.path.join(rom_path, str(x))]
+      if args.resolution != '320x240':
+        cmd_args.extend(['--resolution', args.resolution])
+      subprocess.run(cmd_args)
   exit()
 
 printProgressBar(0, 1, prefix = rom_name.ljust(25), suffix = 'Unzip')
@@ -204,10 +316,12 @@ jpeg_background = os.path.join(rom.build_dir,"gnw_background.jpg")
 # without JPEG background
 # with or without 565 16bits background
 
-rom_filename = os.path.join(rom.build_dir, rom_name+".gw")
+rom_filename = os.path.join(rom.build_dir, rom_name+".gws")
 
-# Final ROM file (compressed)
-final_rom_filename = os.path.join(output_dir,str(rom.mame_fullname+".gw"))
+# Final ROM file (compressed) - incluir resolución en el nombre siempre
+# Crear sufijo de resolución limpio
+resolution_suffix = f"_{gw_width}x{gw_height}"
+final_rom_filename = os.path.join(output_dir, str(rom.mame_fullname + resolution_suffix + ".gws"))
 
 ### Files to build
 BGD_FILE = os.path.join(rom.build_dir,"gnw_background")
@@ -484,8 +598,12 @@ if (rom.drop_shadow ) and (not rom.flag_rendering_lcd_inverted):
 else:
   seg_preview_file = seg_file
 
-preview_file = os.path.join(preview_root,rom.mame_fullname.replace(":","")+".png")
-title_image_file = os.path.join(title_image_root,rom.mame_fullname.replace(":","")+".png")
+# Generar nombres de archivos de preview y title con resolución siempre
+base_name = rom.mame_fullname.replace(":", "")
+resolution_suffix = f"_{gw_width}x{gw_height}"
+preview_file = os.path.join(preview_root, base_name + resolution_suffix + ".png")
+title_image_file = os.path.join(title_image_root, base_name + resolution_suffix + ".png")
+
 seg_png_file = os.path.join(rom.build_dir,rom.name+".png")
 
 if rom.flag_rendering_lcd_inverted:
@@ -624,9 +742,18 @@ for obj in objects_all.splitlines():
     log("object not found:"+obj_id)
   else:
     obj_xmlstr = obj_xml.tostr()
+    
+    # DEBUG: Mostrar el contenido XML de los primeros objetos
+    if obj_id.startswith('g42') or obj_id.startswith('g41'):
+      log(f"DEBUG: Objeto {obj_id}")
+      log(f"DEBUG: XML content: {obj_xmlstr[:200]}...")
 
     search_title = obj_xmlstr.find(b"id=\"title")
     nb_title = obj_xmlstr.count(b"id=\"title")
+    
+    # DEBUG: Mostrar búsqueda de title
+    if obj_id.startswith('g42') or obj_id.startswith('g41'):
+      log(f"DEBUG: search_title result: {search_title}, nb_title: {nb_title}")
 
     # title found and only one object id
     if (search_title > -1) and (nb_title == 1) :
@@ -694,22 +821,100 @@ if (rom.drop_shadow ) and (not rom.flag_rendering_lcd_inverted):
 # otherwise, the background is white and the segments are black
 
 list_obj = [i for i in tab_id if i != 0]
-obj_to_extract = ';'.join(list_obj)
 
-if os.name == 'posix':
-    obj_to_extract ="\'" + obj_to_extract + "\'"
+# OPTIMIZACIÓN MEJORADA: Exportación con paralelización opcional
+print(f"\nExportando {len(list_obj)} segmentos individualmente...")
 
-if rom.flag_rendering_lcd_inverted:
-  cmd = " "+seg_file+" -i "+obj_to_extract+" -j" + " --export-overwrite --export-area-snap" + " --export-background=#000000"+" --export-type=png"
+# Determinar número de hilos
+max_workers = PARALLEL_EXPORT_THREADS
+if max_workers == 0:
+    max_workers = min(4, os.cpu_count() or 1)  # Máximo 4 hilos, mínimo 1
+elif max_workers == 1:
+    max_workers = None  # Procesamiento secuencial
+
+start_time = time.time()
+export_total = len(list_obj)
+completed = 0
+failed_exports = []
+
+if max_workers is None:
+    # Procesamiento secuencial (más estable)
+    print(f"Modo secuencial (1 hilo)")
+    for i, obj_id in enumerate(list_obj, 1):
+        printProgressBar(i, export_total, 
+                        prefix = bar_prefix, 
+                        suffix = f'Export {i}/{export_total}')
+        
+        success, obj_id, message = export_single_segment(
+            (obj_id, seg_file, rom.flag_rendering_lcd_inverted, i, export_total)
+        )
+        
+        if success:
+            completed += 1
+        else:
+            failed_exports.append(obj_id)
+        
+        log(message)
 else:
-  cmd = " "+seg_file+" -i "+obj_to_extract+" -j" + " --export-overwrite --export-area-snap" + " --export-background=#FFFFFF"+" --export-type=png"
+    # Procesamiento paralelo (más rápido)
+    print(f"Modo paralelo ({max_workers} hilos)")
+    
+    # Preparar argumentos para todos los segmentos
+    export_args = [
+        (obj_id, seg_file, rom.flag_rendering_lcd_inverted, i, export_total) 
+        for i, obj_id in enumerate(list_obj, 1)
+    ]
+    
+    # Usar ThreadPoolExecutor para paralelización
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Enviar todas las tareas
+        futures = {executor.submit(export_single_segment, args): args[0] for args in export_args}
+        
+        # Procesar resultados conforme se completan
+        for future in futures:
+            try:
+                success, obj_id, message = future.result()
+                completed += 1
+                
+                # Actualizar barra de progreso
+                printProgressBar(completed, export_total, 
+                                prefix = bar_prefix, 
+                                suffix = f'Export {completed}/{export_total}')
+                
+                if not success:
+                    failed_exports.append(obj_id)
+                
+                log(message)
+                
+            except Exception as e:
+                obj_id = futures[future]
+                failed_exports.append(obj_id)
+                log(f"✗ Excepción exportando {obj_id}: {e}")
 
-cmd= inkscape_path + cmd
+# Mostrar resumen final
+elapsed_time = time.time() - start_time
+if not DEBUG:
+    print("")  # Nueva línea después de la barra de progreso
 
-log(cmd)
+print(f"✓ Exportación completa en {elapsed_time:.1f}s")
+print(f"  Exitosos: {completed - len(failed_exports)}/{export_total}")
+if failed_exports:
+    print(f"  Fallaron: {len(failed_exports)} segmentos: {failed_exports[:5]}{'...' if len(failed_exports) > 5 else ''}")
+else:
+    print(f"  ¡Todos los segmentos exportados correctamente!")
 
-inkscape_output=subprocess.check_output(cmd,stderr=subprocess.DEVNULL,shell=True)
-log(inkscape_output)
+# Comentamos el código original que exportaba todos juntos
+# obj_to_extract = ';'.join(list_obj)
+# if os.name == 'posix':
+#     obj_to_extract ="\'" + obj_to_extract + "\'"
+# if rom.flag_rendering_lcd_inverted:
+#   cmd = " "+seg_file+" -i "+obj_to_extract+" -j" + " --export-overwrite --export-area-snap" + " --export-background=#000000"+" --export-type=png"
+# else:
+#   cmd = " "+seg_file+" -i "+obj_to_extract+" -j" + " --export-overwrite --export-area-snap" + " --export-background=#FFFFFF"+" --export-type=png"
+# cmd= inkscape_path + cmd
+# log(cmd)
+# inkscape_output=subprocess.check_output(cmd,stderr=subprocess.DEVNULL,shell=True)
+# log(inkscape_output)
 
 bar_total=NB_SEGMENTS
 bar_progress=0
@@ -947,6 +1152,11 @@ with open(rom_filename, "wb") as out_file:
   out_file.write(pack("<l", GW_FLAGS))
   rom_offset+=4
 
+  ### Screen dimensions   (4bytes)
+  out_file.write(pack("<H", gw_width))   # 2 bytes para width
+  out_file.write(pack("<H", gw_height))  # 2 bytes para height
+  rom_offset+=4
+
   ## Data section offset  (80bytes)
   rom_offset += 10*2*4
 
@@ -1046,3 +1256,10 @@ log('-> BUILD SUCCESS '+ final_rom_filename+' size:'+str(final_rom_size))
 printProgressBar(bar_progress, bar_total, prefix = bar_prefix, suffix = 'COMPLETE        ')
 if not DEBUG:
   print("")
+
+# Mostrar información del archivo generado
+print(f"\n🎮 ROM generada exitosamente:")
+print(f"   📁 Archivo: {os.path.basename(final_rom_filename)}")
+print(f"   📏 Resolución: {gw_width}x{gw_height}")
+print(f"   💾 Tamaño: {final_rom_size:,} bytes ({final_rom_size/1024:.1f} KB)")
+print(f"   📂 Ubicación: {final_rom_filename}")
